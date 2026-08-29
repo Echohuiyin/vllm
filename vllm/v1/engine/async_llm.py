@@ -914,6 +914,22 @@ class AsyncLLM(EngineClient):
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
 
+    async def suspend(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        if level != 1:
+            logger.warning("Suspend only supports level 1; ignoring level %s.", level)
+            return
+
+        await self.engine_core.suspend_async(level, mode)
+
+        if self.logger_manager is not None:
+            self.logger_manager.record_sleep_state(1, level)
+
+    async def resume(self, tags: list[str] | None = None) -> None:
+        await self.engine_core.resume_async(tags)
+
+        if self.logger_manager is not None:
+            self.logger_manager.record_sleep_state(0, 0)
+
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 

@@ -132,6 +132,16 @@ class CPUWorker(Worker):
         logger.warning("sleep mode is not supported on CPU, ignore it.")
         pass
 
+    def suspend(self, level: int = 1) -> None:
+        logger.warning(
+            "multiprocess pipeline suspend is not supported on CPU, ignore it."
+        )
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        logger.warning(
+            "multiprocess pipeline resume is not supported on CPU, ignore it."
+        )
+
     def determine_available_memory(self) -> int:
         return self.cache_config.cpu_kvcache_space_bytes or 0
 

@@ -102,6 +102,7 @@ class Executor(ABC):
         self.observability_config = vllm_config.observability_config
         self._init_executor()
         self.is_sleeping = False
+        self.sleep_mode: Literal["sleep", "suspend"] | None = None
         self.sleeping_tags: set[str] = set()
         self.kv_output_aggregator: KVOutputAggregator | None = None
 
@@ -310,6 +311,8 @@ class Executor(ABC):
 
     def sleep(self, level: int = 1):
         if self.is_sleeping:
+            if self.sleep_mode != "sleep":
+                raise RuntimeError("resume must complete before starting a sleep cycle")
             logger.warning("Executor is already sleeping.")
             return
         time_before_sleep = time.perf_counter()
@@ -317,6 +320,7 @@ class Executor(ABC):
         time_after_sleep = time.perf_counter()
         self.sleeping_tags = {"weights", "kv_cache"}
         self.is_sleeping = True
+        self.sleep_mode = "sleep"
         logger.info(
             "It took %.6f seconds to fall asleep.", time_after_sleep - time_before_sleep
         )
@@ -325,6 +329,10 @@ class Executor(ABC):
         if not self.is_sleeping:
             logger.warning("Executor is not sleeping.")
             return
+        if self.sleep_mode != "sleep":
+            raise RuntimeError(
+                "A suspend cycle must be completed with resume, not wake_up"
+            )
         if tags:
             for tag in tags:
                 if tag not in self.sleeping_tags:
@@ -347,6 +355,45 @@ class Executor(ABC):
             self.sleeping_tags.clear()
         if not self.sleeping_tags:
             self.is_sleeping = False
+            self.sleep_mode = None
+
+    def suspend(self, level: int = 1):
+        """Release worker memory for a multiprocess pipeline resume."""
+        if self.is_sleeping:
+            if self.sleep_mode != "suspend":
+                raise RuntimeError(
+                    "wake_up must complete before starting a suspend cycle"
+                )
+            logger.warning("Executor is already suspended.")
+            return
+        time_before_suspend = time.perf_counter()
+        self.collective_rpc("suspend", kwargs=dict(level=level))
+        self.sleeping_tags = {"weights", "kv_cache"}
+        self.is_sleeping = True
+        self.sleep_mode = "suspend"
+        logger.info(
+            "It took %.6f seconds to suspend the executor.",
+            time.perf_counter() - time_before_suspend,
+        )
+
+    def resume(self, tags: list[str] | None = None):
+        """Start a multiprocess pipeline restore and make the executor runnable."""
+        if not self.is_sleeping:
+            logger.warning("Executor is not suspended.")
+            return
+        if self.sleep_mode != "suspend":
+            raise RuntimeError(
+                "A sleep cycle must be completed with wake_up, not resume"
+            )
+        time_before_resume = time.perf_counter()
+        self.collective_rpc("resume", kwargs=dict(tags=tags))
+        self.sleeping_tags.clear()
+        self.is_sleeping = False
+        self.sleep_mode = None
+        logger.info(
+            "It took %.6f seconds to start the resume pipeline.",
+            time.perf_counter() - time_before_resume,
+        )
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest

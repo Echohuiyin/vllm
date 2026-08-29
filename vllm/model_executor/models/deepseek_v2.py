@@ -1190,6 +1190,11 @@ class DeepseekV2Model(nn.Module):
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
+        additional_config = vllm_config.additional_config
+        self.multiproc_pipe = (
+            isinstance(additional_config, dict)
+            and additional_config.get("multiproc_pipe", False) is True
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1231,11 +1236,32 @@ class DeepseekV2Model(nn.Module):
         else:
             llama_4_scaling = None
 
+        allocator = None
+        multiproc_pipe = False
+        if self.multiproc_pipe:
+            from vllm_ascend.device_allocator.selector import (
+                get_active_sleep_mode_allocator,
+            )
+
+            allocator = get_active_sleep_mode_allocator()
+            multiproc_pipe = not allocator.ready
         aux_hidden_states = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            if multiproc_pipe:
+                if idx > self.start_layer:
+                    assert allocator is not None
+                    allocator.wait_for_layer(idx)
+                process_after_loading = getattr(
+                    layer, "process_weights_after_loading", None
+                )
+                if callable(process_after_loading):
+                    process_after_loading()
+                if idx == self.end_layer - 1:
+                    assert allocator is not None
+                    allocator.ready = True
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(

@@ -368,6 +368,22 @@ class LLMEngine:
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
 
+    def suspend(self, level: int = 1, mode: PauseMode = "abort"):
+        if level != 1:
+            logger.warning("Suspend only supports level 1; ignoring level %s.", level)
+            return
+
+        self.engine_core.suspend(level, mode)
+
+        if self.logger_manager is not None:
+            self.logger_manager.record_sleep_state(1, level)
+
+    def resume(self, tags: list[str] | None = None):
+        self.engine_core.resume(tags)
+
+        if self.logger_manager is not None:
+            self.logger_manager.record_sleep_state(0, 0)
+
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
 

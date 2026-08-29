@@ -152,6 +152,20 @@ class MultiprocExecutor(Executor):
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
+        additional_config = self.vllm_config.additional_config
+        multiproc_pipe = (
+            isinstance(additional_config, dict)
+            and additional_config.get("multiproc_pipe", False) is True
+        )
+        layer_ready_events = None
+        if multiproc_pipe:
+            num_layers = self.vllm_config.model_config.get_num_layers(
+                self.parallel_config
+            )
+            layer_ready_events = [
+                {index: context.Event() for index in range(num_layers)}
+                for _ in range(self.local_world_size)
+            ]
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
@@ -177,6 +191,11 @@ class MultiprocExecutor(Executor):
                     shared_worker_lock=shared_worker_lock,
                     is_driver_worker=is_driver_worker,
                     inherited_fds=inherited_fds,
+                    layer_ready_events=(
+                        layer_ready_events[local_rank]
+                        if layer_ready_events is not None
+                        else None
+                    ),
                 )
                 unready_workers.append(unready_worker_handle)
                 if inherited_fds is not None:
@@ -575,6 +594,7 @@ class WorkerProc:
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
         is_driver_worker: bool,
+        layer_ready_events: dict[int, Any] | None = None,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
@@ -590,6 +610,8 @@ class WorkerProc:
             "is_driver_worker": is_driver_worker,
             "shared_worker_lock": shared_worker_lock,
         }
+        if layer_ready_events is not None:
+            all_kwargs[local_rank]["layer_ready_events"] = layer_ready_events
         wrapper.init_worker(all_kwargs)
         self.worker = wrapper
 
@@ -639,6 +661,7 @@ class WorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
+        layer_ready_events: dict[int, Any] | None = None,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent
@@ -658,15 +681,21 @@ class WorkerProc:
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
             "is_driver_worker": is_driver_worker,
+            "layer_ready_events": layer_ready_events,
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
         # Run EngineCore busy loop in background process.
+        additional_config = vllm_config.additional_config
+        multiproc_pipe = (
+            isinstance(additional_config, dict)
+            and additional_config.get("multiproc_pipe", False) is True
+        )
         proc = context.Process(
             target=WorkerProc.worker_main,
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
-            daemon=True,
+            daemon=not multiproc_pipe,
         )
 
         proc.start()

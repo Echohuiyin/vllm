@@ -694,6 +694,32 @@ class EngineCore:
         # Resume scheduling (applies to all levels)
         self.resume_scheduler()
 
+    def suspend(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
+        """Pause scheduling and release memory for pipelined restoration."""
+        pause_future = self.pause_scheduler(mode=mode, clear_cache=level >= 1)
+        model_executor = self.model_executor
+        if pause_future is None:
+            model_executor.suspend(level)
+            return None
+
+        future = Future[Any]()
+
+        def pause_complete(f: Future):
+            try:
+                f.result()
+                future.set_result(model_executor.suspend(level))
+            except Exception as e:
+                future.set_exception(e)
+
+        logger.info("Waiting for in-flight requests to complete before suspending...")
+        pause_future.add_done_callback(pause_complete)
+        return future
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        """Start pipelined restoration, then admit requests waiting on layers."""
+        self.model_executor.resume(tags)
+        self.resume_scheduler()
+
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping

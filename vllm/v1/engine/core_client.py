@@ -159,6 +159,12 @@ class EngineCoreClient(ABC):
     def wake_up(self, tags: list[str] | None = None) -> None:
         raise NotImplementedError
 
+    def suspend(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        raise NotImplementedError
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        raise NotImplementedError
+
     def is_sleeping(self) -> bool:
         raise NotImplementedError
 
@@ -234,6 +240,12 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        raise NotImplementedError
+
+    async def suspend_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        raise NotImplementedError
+
+    async def resume_async(self, tags: list[str] | None = None) -> None:
         raise NotImplementedError
 
     async def is_sleeping_async(self) -> bool:
@@ -325,6 +337,15 @@ class InprocClient(EngineCoreClient):
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.engine_core.wake_up(tags)
+
+    def suspend(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        if mode == "wait":
+            raise ValueError("'wait' pause mode is not supported in inproc-engine mode")
+        result = self.engine_core.suspend(level, mode)
+        assert result is None
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        self.engine_core.resume(tags)
 
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
@@ -887,6 +908,12 @@ class SyncMPClient(MPClient):
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.call_utility("wake_up", tags)
 
+    def suspend(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        self.call_utility("suspend", level, mode)
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        self.call_utility("resume", tags)
+
     def is_sleeping(self) -> bool:
         return self.call_utility("is_sleeping")
 
@@ -1122,6 +1149,12 @@ class AsyncMPClient(MPClient):
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         await self.call_utility_async("wake_up", tags)
+
+    async def suspend_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        await self.call_utility_async("suspend", level, mode)
+
+    async def resume_async(self, tags: list[str] | None = None) -> None:
+        await self.call_utility_async("resume", tags)
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")

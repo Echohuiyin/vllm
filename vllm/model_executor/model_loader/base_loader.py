@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 
+import regex as re
 import torch
 import torch.nn as nn
 
@@ -19,6 +20,80 @@ from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
+
+_LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+# multiproc_pipe uses parameter addresses as the stable bridge between model
+# loading, allocator records, and the first forward after resume. Keep these
+# dictionaries process-local: every NPU worker owns one model and one Copier.
+layer_to_addr: dict[str, list[int]] = {}
+addr_to_layer: dict[int, str] = {}
+
+
+def init_map(num_layers: int) -> None:
+    """Initialize the process-local layer/address maps for multiproc_pipe."""
+    if num_layers <= 0:
+        raise ValueError("multiproc_pipe requires at least one model layer")
+    layer_to_addr.clear()
+    # Allocator blocks that cannot be associated with a model tensor still
+    # belong to the immutable weight image.  The Copier restores this bucket
+    # before public and layer-local weights.
+    layer_to_addr["unknown"] = []
+    layer_to_addr["pub"] = []
+    layer_to_addr.update({f"layers.{index}": [] for index in range(num_layers)})
+    addr_to_layer.clear()
+
+
+def locate_splited_weights_on_layer(model: nn.Module) -> None:
+    """Record post-processed parameter and buffer addresses by model layer.
+
+    The intentionally retained ``splited`` spelling is part of the original
+    multiproc_pipe integration API.
+    """
+    if not layer_to_addr:
+        raise RuntimeError("multiproc_pipe layer map was not initialized")
+
+    for addresses in layer_to_addr.values():
+        addresses.clear()
+    addr_to_layer.clear()
+
+    def layer_order(layer_name: str) -> int:
+        if layer_name == "unknown":
+            return -2
+        return -1 if layer_name == "pub" else int(layer_name.split(".")[1])
+
+    named_tensors = list(model.named_parameters(remove_duplicate=False))
+    named_tensors.extend(model.named_buffers(remove_duplicate=False))
+    for name, tensor in named_tensors:
+        address = tensor.data_ptr()
+        if address == 0:
+            continue
+        layer_name = "pub"
+        if (match := _LAYER_PATTERN.search(name)) is not None:
+            layer_index = int(match.group(1))
+            candidate = f"layers.{layer_index}"
+            if candidate not in layer_to_addr:
+                raise RuntimeError(
+                    f"Weight {name!r} belongs to out-of-range layer {layer_index}"
+                )
+            layer_name = candidate
+
+        current = addr_to_layer.get(address)
+        if current is None or layer_order(layer_name) < layer_order(current):
+            addr_to_layer[address] = layer_name
+
+    for address, layer_name in addr_to_layer.items():
+        layer_to_addr[layer_name].append(address)
+    for addresses in layer_to_addr.values():
+        addresses.sort()
+
+
+def _multiproc_pipe_enabled(vllm_config: VllmConfig) -> bool:
+    additional_config = vllm_config.additional_config
+    return (
+        isinstance(additional_config, dict)
+        and additional_config.get("multiproc_pipe", False) is True
+    )
 
 
 class BaseModelLoader(ABC):
@@ -72,6 +147,10 @@ class BaseModelLoader(ABC):
                 )
 
             process_weights_after_loading(model, model_config, target_device)
+
+            if _multiproc_pipe_enabled(vllm_config):
+                init_map(model_config.get_num_layers(vllm_config.parallel_config))
+                locate_splited_weights_on_layer(model)
 
         return model.eval()
 

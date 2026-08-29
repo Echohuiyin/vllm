@@ -22,6 +22,8 @@ from vllm.engine.arg_utils import (
     optional_type,
     parse_type,
 )
+from vllm.platforms import current_platform
+from vllm.platforms.interface import Platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
@@ -43,6 +45,34 @@ def test_optional_type():
     optional_type_func = optional_type(int)
     assert optional_type_func("None") is None
     assert optional_type_func("42") == 42
+
+
+def test_platform_postprocess_cli_args_default_is_noop():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args([])
+    before = vars(args).copy()
+
+    Platform.postprocess_cli_args(args)
+
+    assert vars(args) == before
+
+
+def test_platform_postprocess_cli_args_runs_before_engine_args(monkeypatch):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parser.add_argument("--platform-option")
+    args = parser.parse_args(["--platform-option", "enabled"])
+
+    def postprocess_cli_args(namespace):
+        namespace.additional_config = {
+            **namespace.additional_config,
+            "platform_option": namespace.platform_option,
+        }
+
+    monkeypatch.setattr(current_platform, "postprocess_cli_args", postprocess_cli_args)
+
+    engine_args = EngineArgs.from_cli_args(args)
+
+    assert engine_args.additional_config == {"platform_option": "enabled"}
 
 
 @pytest.mark.parametrize(

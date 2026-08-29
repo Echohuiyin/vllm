@@ -415,6 +415,11 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        additional_config = vllm_config.additional_config
+        self.multiproc_pipe = (
+            isinstance(additional_config, dict)
+            and additional_config.get("multiproc_pipe", False) is True
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -437,13 +442,30 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        allocator = None
+        multiproc_pipe = False
+        if self.multiproc_pipe:
+            from vllm_ascend.device_allocator.selector import (
+                get_active_sleep_mode_allocator,
+            )
+
+            allocator = get_active_sleep_mode_allocator()
+            multiproc_pipe = not allocator.ready
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(
+        for local_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
+            if multiproc_pipe:
+                actual_layer_idx = self.start_layer + local_idx
+                if local_idx > 0:
+                    assert allocator is not None
+                    allocator.wait_for_layer(actual_layer_idx)
+                if actual_layer_idx == self.end_layer - 1:
+                    assert allocator is not None
+                    allocator.ready = True
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                aux_hidden_states, local_idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:

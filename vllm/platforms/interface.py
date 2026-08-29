@@ -397,6 +397,16 @@ class Platform:
         pass
 
     @classmethod
+    def postprocess_cli_args(cls, args: Any) -> None:
+        """Apply platform-specific updates after CLI arguments are parsed.
+
+        Out-of-tree platforms can use this hook to move custom CLI arguments
+        into fields owned by :class:`EngineArgs`, such as ``additional_config``.
+        The namespace is updated in place before ``EngineArgs`` is constructed.
+        """
+        pass
+
+    @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         """
         Apply the platform-specific default values to the config.

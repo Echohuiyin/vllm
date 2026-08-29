@@ -43,6 +43,23 @@ async def wake_up(raw_request: Request):
     return Response(status_code=200)
 
 
+@router.post("/suspend")
+async def suspend(raw_request: Request):
+    level = raw_request.query_params.get("level", "1")
+    mode = raw_request.query_params.get("mode", "abort")
+    await engine_client(raw_request).suspend(int(level), mode)
+    return Response(status_code=200)
+
+
+@router.post("/resume")
+async def resume(raw_request: Request):
+    tags = raw_request.query_params.getlist("tags")
+    if tags == []:
+        tags = None
+    await engine_client(raw_request).resume(tags)
+    return Response(status_code=200)
+
+
 @router.get("/is_sleeping")
 async def is_sleeping(raw_request: Request):
     is_sleeping = await engine_client(raw_request).is_sleeping()

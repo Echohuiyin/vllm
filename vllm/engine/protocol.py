@@ -158,6 +158,16 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def suspend(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
+        """Suspend the engine for multiprocess pipelined restoration."""
+        ...
+
+    @abstractmethod
+    async def resume(self, tags: list[str] | None = None) -> None:
+        """Start multiprocess pipelined restoration and resume scheduling."""
+        ...
+
+    @abstractmethod
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
         ...

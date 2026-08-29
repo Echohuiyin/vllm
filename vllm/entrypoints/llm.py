@@ -1711,6 +1711,23 @@ class LLM:
         """
         self.llm_engine.wake_up(tags)
 
+    def suspend(self, level: int = 1, mode: PauseMode = "abort"):
+        """Suspend the engine for multiprocess pipelined weight restoration.
+
+        Args:
+            level: The suspend level. Pipelined restoration supports level 1.
+            mode: How to handle existing requests before suspending.
+        """
+        self.llm_engine.suspend(level=level, mode=mode)
+
+    def resume(self, tags: list[str] | None = None):
+        """Start pipelined weight restoration and resume request scheduling.
+
+        Args:
+            tags: Optional allocation tags to restore.
+        """
+        self.llm_engine.resume(tags)
+
     def get_metrics(self) -> list["Metric"]:
         """Return a snapshot of aggregated metrics from Prometheus.
 
