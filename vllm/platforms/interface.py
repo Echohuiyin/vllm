@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 else:
     FlexibleArgumentParser = object
 
@@ -405,6 +407,32 @@ class Platform:
         The namespace is updated in place before ``EngineArgs`` is constructed.
         """
         pass
+
+    @classmethod
+    def adjust_kv_cache_configs(
+        cls,
+        vllm_config: "VllmConfig",
+        model_executor: "Executor",
+        kv_cache_configs: list["KVCacheConfig"],
+    ) -> list["KVCacheConfig"]:
+        """Apply platform-specific physical KV cache constraints."""
+        return kv_cache_configs
+
+    @classmethod
+    def validate_sleep_level(cls, vllm_config: "VllmConfig", level: int) -> None:
+        """Reject platform-specific sleep levels before scheduler state changes."""
+
+    @classmethod
+    def validate_wake_tags(
+        cls, vllm_config: "VllmConfig", tags: list[str] | None
+    ) -> None:
+        """Reject platform-specific wake tags before executor state changes."""
+
+    @classmethod
+    def validate_resume_tags(
+        cls, vllm_config: "VllmConfig", tags: list[str] | None
+    ) -> None:
+        """Reject platform-specific resume tags before executor state changes."""
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:

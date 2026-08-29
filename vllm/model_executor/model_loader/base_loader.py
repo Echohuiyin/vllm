@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+from collections.abc import Iterator, Mapping
+from typing import Any
 
 import regex as re
 import torch
@@ -45,11 +47,7 @@ def init_map(num_layers: int) -> None:
 
 
 def locate_splited_weights_on_layer(model: nn.Module) -> None:
-    """Record post-processed parameter and buffer addresses by model layer.
-
-    The intentionally retained ``splited`` spelling is part of the original
-    multiproc_pipe integration API.
-    """
+    """Record post-processed persistent tensor addresses by model layer."""
     if not layer_to_addr:
         raise RuntimeError("multiproc_pipe layer map was not initialized")
 
@@ -62,12 +60,10 @@ def locate_splited_weights_on_layer(model: nn.Module) -> None:
             return -2
         return -1 if layer_name == "pub" else int(layer_name.split(".")[1])
 
-    named_tensors = list(model.named_parameters(remove_duplicate=False))
-    named_tensors.extend(model.named_buffers(remove_duplicate=False))
-    for name, tensor in named_tensors:
+    def record_tensor(name: str, tensor: torch.Tensor) -> None:
         address = tensor.data_ptr()
         if address == 0:
-            continue
+            return
         layer_name = "pub"
         if (match := _LAYER_PATTERN.search(name)) is not None:
             layer_index = int(match.group(1))
@@ -82,18 +78,56 @@ def locate_splited_weights_on_layer(model: nn.Module) -> None:
         if current is None or layer_order(layer_name) < layer_order(current):
             addr_to_layer[address] = layer_name
 
+    named_tensors = list(model.named_parameters(remove_duplicate=False))
+    named_tensors.extend(model.named_buffers(remove_duplicate=False))
+    for name, tensor in named_tensors:
+        record_tensor(name, tensor)
+
+    def tensors_in_container(
+        value: Any, visited: dict[int, Any]
+    ) -> Iterator[torch.Tensor]:
+        if isinstance(value, torch.Tensor):
+            yield value
+            return
+        if not isinstance(value, (Mapping, list, tuple, set, frozenset)):
+            return
+        identity = id(value)
+        if identity in visited:
+            return
+        visited[identity] = value  # Retain temporary hook containers against id reuse.
+        for item in value.values() if isinstance(value, Mapping) else value:
+            yield from tensors_in_container(item, visited)
+
+    def record_value(name: str, value: Any, visited: dict[int, Any]) -> None:
+        for tensor in tensors_in_container(value, visited):
+            record_tensor(name, tensor)
+
+    def record_hook(name: str, owner: Any, visited: dict[int, Any]) -> None:
+        hook = getattr(owner, "get_multiproc_pipe_persistent_tensors", None)
+        if callable(hook):
+            record_value(name, hook(), visited)
+
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        visited: dict[int, Any] = {}
+        attributes = vars(module)
+        for attribute_name, value in attributes.items():
+            if attribute_name not in {"_parameters", "_buffers", "_modules"}:
+                record_value(module_name, value, visited)
+            if not isinstance(value, (torch.Tensor, nn.Module)):
+                record_hook(module_name, value, visited)
+        record_hook(module_name, module, visited)
+
+        implementation = attributes.get("impl")
+        if hasattr(implementation, "__dict__") and not isinstance(
+            implementation, nn.Module
+        ):
+            for value in vars(implementation).values():
+                record_value(module_name, value, visited)
+
     for address, layer_name in addr_to_layer.items():
         layer_to_addr[layer_name].append(address)
     for addresses in layer_to_addr.values():
         addresses.sort()
-
-
-def _multiproc_pipe_enabled(vllm_config: VllmConfig) -> bool:
-    additional_config = vllm_config.additional_config
-    return (
-        isinstance(additional_config, dict)
-        and additional_config.get("multiproc_pipe", False) is True
-    )
 
 
 class BaseModelLoader(ABC):
@@ -147,10 +181,6 @@ class BaseModelLoader(ABC):
                 )
 
             process_weights_after_loading(model, model_config, target_device)
-
-            if _multiproc_pipe_enabled(vllm_config):
-                init_map(model_config.get_num_layers(vllm_config.parallel_config))
-                locate_splited_weights_on_layer(model)
 
         return model.eval()
 

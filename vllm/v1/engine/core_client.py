@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
+from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, TypeAlias, TypeVar
@@ -669,10 +670,14 @@ class MPClient(EngineCoreClient):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine manager under timeout and clean up resources."""
+        self._fail_pending_utility_calls()
         if self._finalizer.detach() is not None:
             if self.resources.engine_manager is not None:
                 self.resources.engine_manager.shutdown(timeout=timeout)
             self.resources()
+
+    def _fail_pending_utility_calls(self) -> None:
+        _fail_utility_results(self.utility_results)
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
@@ -740,7 +745,11 @@ def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
     """Set the result from a utility method in the waiting future."""
-    future = utility_results.pop(output.call_id)
+    future = utility_results.pop(output.call_id, None)
+    if future is None:
+        # Engine death or client shutdown may already have failed and removed
+        # every pending call before a buffered response is observed.
+        return
     failure_message = output.failure_message
     try:
         if failure_message is not None:
@@ -748,7 +757,7 @@ def _process_utility_output(
         else:
             assert output.result is not None
             future.set_result(output.result.result)
-    except asyncio.InvalidStateError:
+    except (asyncio.InvalidStateError, ConcurrentInvalidStateError):
         # This can happen if the future is cancelled due to the
         # original calling task being cancelled.
         if failure_message is not None:
@@ -756,6 +765,33 @@ def _process_utility_output(
                 "Cancelled call to utility method failed with error: %s",
                 failure_message,
             )
+
+
+def _fail_utility_results(utility_results: dict[int, AnyFuture]) -> None:
+    """Wake every utility caller when its EngineCore can no longer reply."""
+    pending = tuple(utility_results.values())
+    utility_results.clear()
+
+    for future in pending:
+        if isinstance(future, asyncio.Future):
+            loop = future.get_loop()
+            async_future: asyncio.Future[Any] = future
+
+            def fail_async_future(
+                current_future: asyncio.Future[Any] = async_future,
+            ) -> None:
+                if not current_future.done():
+                    current_future.set_exception(EngineDeadError(suppress_context=True))
+
+            if loop.is_closed():
+                continue
+            if in_loop(loop):
+                fail_async_future()
+            else:
+                loop.call_soon_threadsafe(fail_async_future)
+        elif not future.done():
+            with contextlib.suppress(ConcurrentInvalidStateError):
+                future.set_exception(EngineDeadError(suppress_context=True))
 
 
 class SyncMPClient(MPClient):
@@ -811,6 +847,8 @@ class SyncMPClient(MPClient):
                     else:
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
+                if resources.engine_dead:
+                    _fail_utility_results(utility_results)
                 outputs_queue.put_nowait(e)
             finally:
                 # Close sockets.
@@ -858,7 +896,14 @@ class SyncMPClient(MPClient):
         call_id = uuid.uuid1().int >> 64
         future: Future[Any] = Future()
         self.utility_results[call_id] = future
-        self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
+        try:
+            self._send_input(
+                EngineCoreRequestType.UTILITY,
+                (0, call_id, method, args),
+            )
+        except BaseException:
+            self.utility_results.pop(call_id, None)
+            raise
 
         return future.result()
 
@@ -1030,8 +1075,12 @@ class AsyncMPClient(MPClient):
                     if outputs.outputs or outputs.scheduler_stats:
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
+                if resources.engine_dead:
+                    _fail_utility_results(utility_results)
                 outputs_queue.put_nowait(e)
             except asyncio.CancelledError:
+                if resources.engine_dead:
+                    _fail_utility_results(utility_results)
                 outputs_queue.put_nowait(EngineDeadError())
 
         resources.output_queue_task = asyncio.create_task(
@@ -1099,7 +1148,11 @@ class AsyncMPClient(MPClient):
             EngineCoreRequestType.UTILITY.value,
             *self.encoder.encode((self.client_index, call_id, method, args)),
         )
-        await self._send_input_message(message, engine, args)
+        try:
+            await self._send_input_message(message, engine, args)
+        except BaseException:
+            self.utility_results.pop(call_id, None)
+            raise
         self._ensure_output_queue_task()
         return await future
 

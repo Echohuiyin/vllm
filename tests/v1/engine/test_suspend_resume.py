@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+from collections import deque
 from concurrent.futures import Future
+from threading import Thread
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
@@ -12,9 +15,18 @@ from vllm.entrypoints.serve.sleep.api_router import resume as http_resume
 from vllm.entrypoints.serve.sleep.api_router import suspend as http_suspend
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCore
-from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
+from vllm.v1.engine.core_client import (
+    AsyncMPClient,
+    InprocClient,
+    SyncMPClient,
+    _fail_utility_results,
+)
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
+from vllm.v1.worker.worker_base import WorkerFatalError, WorkerRetryableError
 
 
 class _TestExecutor(Executor):
@@ -99,6 +111,7 @@ def test_executor_rejects_crossed_sleep_and_suspend_pairs() -> None:
 @pytest.mark.parametrize(("level", "clear_cache"), [(0, False), (1, True)])
 def test_engine_core_suspend_resume_order(level: int, clear_cache: bool) -> None:
     engine_core = object.__new__(EngineCore)
+    engine_core.vllm_config = Mock()
     calls = Mock()
     engine_core.model_executor = Mock()
     engine_core.model_executor.suspend.side_effect = calls.executor_suspend
@@ -122,22 +135,91 @@ def test_engine_core_suspend_resume_order(level: int, clear_cache: bool) -> None
     ]
 
 
+def test_engine_core_validates_sleep_before_pausing_scheduler() -> None:
+    engine_core = object.__new__(EngineCore)
+    engine_core.vllm_config = Mock()
+    engine_core.pause_scheduler = Mock()
+
+    with (
+        patch(
+            "vllm.v1.engine.core.current_platform.validate_sleep_level",
+            side_effect=ValueError("unsupported level"),
+        ),
+        pytest.raises(ValueError, match="unsupported level"),
+    ):
+        engine_core.sleep(level=2)
+
+    engine_core.pause_scheduler.assert_not_called()
+
+
+@pytest.mark.parametrize("level", [-1, 3, True, 1.0])
+def test_engine_core_rejects_invalid_sleep_level_before_pausing(level) -> None:
+    engine_core = object.__new__(EngineCore)
+    engine_core.pause_scheduler = Mock()
+
+    with pytest.raises(ValueError, match="0, 1, or 2"):
+        engine_core.sleep(level=level)
+
+    engine_core.pause_scheduler.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["wake_up", "resume"])
+def test_engine_core_validates_wake_before_calling_executor(method: str) -> None:
+    engine_core = object.__new__(EngineCore)
+    engine_core.vllm_config = Mock()
+    engine_core.model_executor = Mock()
+    engine_core.resume_scheduler = Mock()
+
+    validator = "validate_wake_tags" if method == "wake_up" else "validate_resume_tags"
+    with (
+        patch(
+            f"vllm.v1.engine.core.current_platform.{validator}",
+            side_effect=ValueError("unsupported tags"),
+        ),
+        pytest.raises(ValueError, match="unsupported tags"),
+    ):
+        getattr(engine_core, method)(tags=["weights"])
+
+    getattr(engine_core.model_executor, method).assert_not_called()
+    engine_core.resume_scheduler.assert_not_called()
+
+
 def test_engine_core_waits_for_async_pause_before_suspend() -> None:
     engine_core = object.__new__(EngineCore)
+    engine_core.vllm_config = Mock()
     pause_future: Future[None] = Future()
     engine_core.pause_scheduler = Mock(return_value=pause_future)
     engine_core.model_executor = Mock()
+    engine_core.model_executor.is_sleeping = False
     engine_core.model_executor.suspend.return_value = None
+    engine_core.resume_scheduler = Mock()
+    engine_core.is_scheduler_paused = Mock(return_value=True)
 
     result = engine_core.suspend(level=1, mode="wait")
 
     assert isinstance(result, Future)
     engine_core.model_executor.suspend.assert_not_called()
+    assert not engine_core.is_sleeping()
+
+    with pytest.raises(RuntimeError, match="transition is still in progress"):
+        engine_core.resume()
+
+    with pytest.raises(RuntimeError, match="transition is still in progress"):
+        EngineCore.resume_scheduler(engine_core)
+
+    engine_core.model_executor.resume.assert_not_called()
+    engine_core.resume_scheduler.assert_not_called()
 
     pause_future.set_result(None)
 
     assert result.result() is None
     engine_core.model_executor.suspend.assert_called_once_with(1)
+
+    engine_core.model_executor.is_sleeping = True
+    assert engine_core.is_sleeping()
+    engine_core.resume()
+    engine_core.model_executor.resume.assert_called_once_with(None)
+    engine_core.resume_scheduler.assert_called_once_with()
 
 
 def test_offline_suspend_resume_arguments_reach_engine_core_client() -> None:
@@ -262,3 +344,274 @@ async def test_async_core_client_forwards_suspend_resume_arguments() -> None:
         call("suspend", 1, "keep"),
         call("resume", ["weights"]),
     ]
+
+
+def test_worker_fatal_error_is_reported_before_process_exit() -> None:
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc.rpc_broadcast_mq = Mock()
+    worker_proc.rpc_broadcast_mq.dequeue.return_value = ("suspend", (), {}, None)
+    worker_proc.worker = Mock()
+    worker_proc.worker.suspend.side_effect = WorkerFatalError("ambiguous Famem state")
+    worker_proc.enqueue_output = Mock()
+    worker_proc.rank = 0
+
+    with pytest.raises(WorkerFatalError, match="ambiguous Famem state"):
+        worker_proc.worker_busy_loop()
+
+    response = worker_proc.enqueue_output.call_args.args[0]
+    assert isinstance(response, RuntimeError)
+    assert str(response) == "ambiguous Famem state"
+
+
+def test_worker_retryable_error_uses_distinct_response_status() -> None:
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc.worker_response_mq = Mock()
+
+    worker_proc.enqueue_output(WorkerRetryableError("lease is busy"))
+
+    worker_proc.worker_response_mq.enqueue.assert_called_once_with(
+        (WorkerProc.ResponseStatus.RETRYABLE_FAILURE, "lease is busy")
+    )
+
+
+def test_lifecycle_rpc_failure_terminates_complete_worker_group() -> None:
+    executor = object.__new__(MultiprocExecutor)
+    executor.vllm_config = Mock(additional_config={"multiproc_pipe": True})
+    executor.rpc_broadcast_mq = Mock()
+    response_mq = Mock()
+    response_mq.dequeue.return_value = (
+        WorkerProc.ResponseStatus.FAILURE,
+        "rank entered an ambiguous state",
+    )
+    executor.response_mqs = [response_mq]
+    executor.futures_queue = deque()
+    executor._init_failure_state()
+    failure_callback = Mock()
+    executor.failure_callback = failure_callback
+    executor.shutdown = Mock()
+
+    with pytest.raises(RuntimeError, match="ambiguous state"):
+        executor.collective_rpc("suspend")
+
+    assert executor.is_failed
+    executor.shutdown.assert_called_once_with()
+    assert executor.failure_callback is None
+    failure_callback.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "statuses,retryable",
+    [
+        ([WorkerProc.ResponseStatus.RETRYABLE_FAILURE] * 2, True),
+        (
+            [
+                WorkerProc.ResponseStatus.SUCCESS,
+                WorkerProc.ResponseStatus.RETRYABLE_FAILURE,
+            ],
+            False,
+        ),
+    ],
+)
+def test_lifecycle_rpc_retries_only_when_every_rank_rejects_without_state_change(
+    statuses, retryable
+) -> None:
+    executor = object.__new__(MultiprocExecutor)
+    executor.vllm_config = Mock(additional_config={"multiproc_pipe": True})
+    executor.rpc_broadcast_mq = Mock()
+    executor.response_mqs = [Mock(), Mock()]
+    for mq, status in zip(executor.response_mqs, statuses, strict=True):
+        mq.dequeue.return_value = (
+            status,
+            None if status is WorkerProc.ResponseStatus.SUCCESS else "lease is busy",
+        )
+    executor.futures_queue = deque()
+    executor._init_failure_state()
+    executor.shutdown = Mock()
+
+    with pytest.raises(RuntimeError) as error:
+        executor.collective_rpc("resume")
+
+    assert isinstance(error.value, WorkerRetryableError) is retryable
+    assert executor.is_failed is not retryable
+    assert executor.shutdown.called is not retryable
+
+
+def test_lifecycle_rpc_timeout_terminates_complete_worker_group() -> None:
+    executor = object.__new__(MultiprocExecutor)
+    executor.vllm_config = Mock(additional_config={"multiproc_pipe": True})
+    executor.rpc_broadcast_mq = Mock()
+    response_mq = Mock()
+    response_mq.dequeue.side_effect = TimeoutError("rank did not reply")
+    executor.response_mqs = [response_mq]
+    executor.futures_queue = deque()
+    executor._init_failure_state()
+    executor.shutdown = Mock()
+
+    with pytest.raises(TimeoutError, match="RPC call to suspend timed out"):
+        executor.collective_rpc("suspend", timeout=0.1)
+
+    assert executor.is_failed
+    executor.shutdown.assert_called_once_with()
+
+
+def test_lifecycle_rpc_enqueue_timeout_terminates_complete_worker_group() -> None:
+    executor = object.__new__(MultiprocExecutor)
+    executor.vllm_config = Mock(additional_config={"multiproc_pipe": True})
+    executor.rpc_broadcast_mq = Mock()
+    executor.rpc_broadcast_mq.enqueue.side_effect = TimeoutError(
+        "workers stopped reading"
+    )
+    executor.response_mqs = []
+    executor.futures_queue = deque()
+    executor._init_failure_state()
+    executor.shutdown = Mock()
+
+    with pytest.raises(TimeoutError, match="workers stopped reading"):
+        executor.collective_rpc("suspend", timeout=0.1)
+
+    assert executor.is_failed
+    executor.shutdown.assert_called_once_with()
+    enqueue_timeout = executor.rpc_broadcast_mq.enqueue.call_args.kwargs["timeout"]
+    assert 0 < enqueue_timeout <= 0.1
+
+
+@pytest.mark.parametrize("response_timeout", [False, True])
+def test_lifecycle_rpc_error_is_retryable_without_multiproc_pipe(
+    response_timeout: bool,
+) -> None:
+    executor = object.__new__(MultiprocExecutor)
+    executor.vllm_config = Mock(additional_config={})
+    executor.rpc_broadcast_mq = Mock()
+    response_mq = Mock()
+    if response_timeout:
+        response_mq.dequeue.side_effect = TimeoutError("rank did not reply")
+    else:
+        response_mq.dequeue.return_value = (
+            WorkerProc.ResponseStatus.FAILURE,
+            "wake-up validation failed before changing mappings",
+        )
+    executor.response_mqs = [response_mq]
+    executor.futures_queue = deque()
+    executor._init_failure_state()
+    executor.shutdown = Mock()
+
+    expected_error = "timed out" if response_timeout else "validation failed"
+    with pytest.raises((RuntimeError, TimeoutError), match=expected_error):
+        executor.collective_rpc("wake_up", timeout=0.1)
+
+    assert not executor.is_failed
+    executor.shutdown.assert_not_called()
+
+
+def test_lifecycle_rpc_failure_notifies_engine_when_shutdown_fails() -> None:
+    executor = object.__new__(MultiprocExecutor)
+    executor._init_failure_state()
+    failure_callback = Mock()
+    executor.failure_callback = failure_callback
+    executor.shutdown = Mock(side_effect=RuntimeError("queue cleanup failed"))
+
+    with pytest.raises(RuntimeError, match="queue cleanup failed"):
+        executor._handle_worker_failure()
+
+    assert executor.is_failed
+    assert executor.failure_callback is None
+    failure_callback.assert_called_once_with()
+
+
+def test_concurrent_worker_failures_shutdown_and_notify_once() -> None:
+    executor = object.__new__(MultiprocExecutor)
+    executor._init_failure_state()
+    failure_callback = Mock()
+    executor.failure_callback = failure_callback
+    executor.shutdown = Mock()
+
+    executor._handle_worker_failure()
+    executor._handle_worker_failure()
+
+    executor.shutdown.assert_called_once_with()
+    failure_callback.assert_called_once_with()
+
+
+def test_resume_scheduler_rejects_physically_sleeping_executor() -> None:
+    engine_core = object.__new__(EngineCore)
+    engine_core.model_executor = Mock(is_sleeping=True)
+    engine_core.scheduler = Mock()
+
+    with pytest.raises(RuntimeError, match="call wake_up or resume first"):
+        engine_core.resume_scheduler()
+
+    engine_core.scheduler.set_pause_state.assert_not_called()
+
+
+def test_engine_death_fails_pending_sync_utility_call() -> None:
+    future: Future[None] = Future()
+    utility_results = {1: future}
+
+    _fail_utility_results(utility_results)
+
+    assert not utility_results
+    with pytest.raises(EngineDeadError):
+        future.result(timeout=0.1)
+
+
+def test_multiproc_pipe_engine_core_process_uses_frontend_parent_guard() -> None:
+    context = Mock()
+    process = context.Process.return_value
+    process.exitcode = None
+    config = SimpleNamespace(
+        additional_config={"multiproc_pipe": True},
+        parallel_config=SimpleNamespace(data_parallel_size=1, use_ray=False),
+    )
+
+    with (
+        patch("vllm.v1.engine.utils.get_mp_context", return_value=context),
+        patch("vllm.v1.engine.utils.weakref.finalize", return_value=Mock()),
+        patch("vllm.v1.engine.utils.os.getpid", return_value=321),
+        patch.object(CoreEngineProcManager, "finished_procs", return_value={}),
+    ):
+        CoreEngineProcManager(
+            local_engine_count=1,
+            start_index=0,
+            local_start_index=0,
+            vllm_config=config,
+            local_client=True,
+            handshake_address="ipc:///unused",
+            executor_class=_TestExecutor,
+            log_stats=False,
+        )
+
+    process_kwargs = context.Process.call_args.kwargs["kwargs"]
+    assert process_kwargs["expected_parent_pid"] == 321
+    process.start.assert_called_once_with()
+
+    with (
+        patch("vllm.v1.engine.utils.get_mp_context", return_value=Mock()),
+        patch("vllm.v1.engine.utils.threading.current_thread", return_value=object()),
+        patch("vllm.v1.engine.utils.threading.main_thread", return_value=object()),
+        pytest.raises(RuntimeError, match="frontend main thread"),
+    ):
+        CoreEngineProcManager(
+            1,
+            0,
+            0,
+            config,
+            True,
+            "ipc:///unused",
+            _TestExecutor,
+            False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_engine_death_fails_pending_async_utility_call_thread_safely() -> None:
+    future = asyncio.get_running_loop().create_future()
+    utility_results = {1: future}
+
+    monitor = Thread(target=_fail_utility_results, args=(utility_results,))
+    monitor.start()
+    monitor.join(timeout=1.0)
+
+    assert not monitor.is_alive()
+    assert not utility_results
+    with pytest.raises(EngineDeadError):
+        await asyncio.wait_for(future, timeout=0.1)

@@ -30,6 +30,19 @@ logger = init_logger(__name__)
 _R = TypeVar("_R")
 
 
+class WorkerRetryableError(RuntimeError):
+    """A Worker RPC rejection guaranteed to leave device state unchanged."""
+
+
+class WorkerFatalError(SystemExit):
+    """Terminate a worker whose device state is no longer recoverable.
+
+    This deliberately derives from ``SystemExit`` so utility-RPC handlers do
+    not turn a fatal device-state transition into an ordinary, retryable RPC
+    error. Multiprocessing dispatchers report the failure before re-raising it.
+    """
+
+
 class WorkerBase:
     """Worker interface that allows vLLM to cleanly separate implementations for
     different hardware. Also abstracts control plane communication, e.g., to

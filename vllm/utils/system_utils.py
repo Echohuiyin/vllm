@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import multiprocessing
 import os
 import signal
@@ -26,6 +27,40 @@ logger = init_logger(__name__)
 
 CYAN = "\033[0;36m"
 RESET = "\033[0;0m"
+
+
+def arm_parent_death_signal(expected_parent_pid: int, *, process_name: str) -> None:
+    """Have Linux kill this process when its expected parent exits."""
+    if (
+        not isinstance(expected_parent_pid, int)
+        or isinstance(expected_parent_pid, bool)
+        or expected_parent_pid <= 0
+    ):
+        raise ValueError(f"{process_name} parent PID must be a positive integer")
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError(f"{process_name} parent-death protection requires Linux")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+    # PR_SET_PDEATHSIG is not retroactive; close the parent-exit race after
+    # arming it. Reached after os.kill only in mocked unit tests.
+    if os.getppid() != expected_parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+        raise RuntimeError(
+            f"{process_name} parent exited before parent-death protection was armed"
+        )
 
 
 # Environment variable utilities

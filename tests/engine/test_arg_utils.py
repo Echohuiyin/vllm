@@ -57,6 +57,14 @@ def test_platform_postprocess_cli_args_default_is_noop():
     assert vars(args) == before
 
 
+def test_platform_adjust_kv_cache_configs_default_is_noop():
+    configs = [object()]
+
+    adjusted = Platform.adjust_kv_cache_configs(object(), object(), configs)
+
+    assert adjusted is configs
+
+
 def test_platform_postprocess_cli_args_runs_before_engine_args(monkeypatch):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     parser.add_argument("--platform-option")

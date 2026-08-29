@@ -97,6 +97,19 @@ class CoreEngineProcManager:
         client_handshake_address: str | None = None,
     ):
         context = get_mp_context()
+        additional_config = vllm_config.additional_config
+        multiproc_pipe_enabled = (
+            isinstance(additional_config, dict)
+            and additional_config.get("multiproc_pipe") is True
+        )
+        if (
+            multiproc_pipe_enabled
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            raise RuntimeError(
+                "multiproc_pipe EngineCore must be started from the "
+                "frontend main thread"
+            )
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -107,6 +120,8 @@ class CoreEngineProcManager:
 
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
+        if multiproc_pipe_enabled:
+            common_kwargs["expected_parent_pid"] = os.getpid()
 
         is_dp = vllm_config.parallel_config.data_parallel_size > 1
 

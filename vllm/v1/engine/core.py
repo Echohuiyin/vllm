@@ -26,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -35,7 +36,11 @@ from vllm.utils.gc_utils import (
 )
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
-from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.utils.system_utils import (
+    arm_parent_death_signal,
+    decorate_logs,
+    set_process_title,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -213,6 +218,7 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+        self._lifecycle_transition: Future[Any] | None = None
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -255,6 +261,9 @@ class EngineCore:
 
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
+        )
+        kv_cache_configs = current_platform.adjust_kv_cache_configs(
+            vllm_config, self.model_executor, kv_cache_configs
         )
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
@@ -617,6 +626,7 @@ class EngineCore:
         - ``keep``: Set PAUSED_ALL; return a Future that completes when the
           output queue is empty.
         """
+        self._require_no_lifecycle_transition("pause_scheduler")
         if mode not in ("keep", "abort", "wait"):
             raise ValueError(f"Invalid pause mode: {mode}")
         if mode == "wait":
@@ -634,6 +644,12 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        self._require_no_lifecycle_transition("resume_scheduler")
+        if self.model_executor.is_sleeping:
+            raise RuntimeError(
+                "Cannot resume the scheduler while the model executor is "
+                "sleeping; call wake_up or resume first"
+            )
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
 
     def is_scheduler_paused(self) -> bool:
@@ -653,6 +669,11 @@ class EngineCore:
                 documentation of pause_scheduler method.
         """
 
+        self._require_no_lifecycle_transition("sleep")
+        if type(level) is not int or level not in (0, 1, 2):
+            raise ValueError("Sleep level must be one of 0, 1, or 2.")
+        current_platform.validate_sleep_level(self.vllm_config, level)
+
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
@@ -666,13 +687,18 @@ class EngineCore:
             return None
 
         future = Future[Any]()
+        self._lifecycle_transition = future
 
         def pause_complete(f: Future):
             try:
                 f.result()  # propagate any exception
-                future.set_result(model_executor.sleep(level))
+                result = model_executor.sleep(level)
             except Exception as e:
+                self._lifecycle_transition = None
                 future.set_exception(e)
+            else:
+                self._lifecycle_transition = None
+                future.set_result(result)
 
         logger.info("Waiting for in-flight requests to complete before sleeping...")
         pause_future.add_done_callback(pause_complete)
@@ -684,6 +710,9 @@ class EngineCore:
         Args:
             tags: Tags to wake up. Use ["scheduling"] for level 0 wake up.
         """
+        self._require_no_lifecycle_transition("wake_up")
+        current_platform.validate_wake_tags(self.vllm_config, tags)
+
         if tags is not None and "scheduling" in tags:
             # Remove "scheduling" from tags if there are other tags to process.
             tags = [t for t in tags if t != "scheduling"]
@@ -696,6 +725,7 @@ class EngineCore:
 
     def suspend(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
         """Pause scheduling and release memory for pipelined restoration."""
+        self._require_no_lifecycle_transition("suspend")
         pause_future = self.pause_scheduler(mode=mode, clear_cache=level >= 1)
         model_executor = self.model_executor
         if pause_future is None:
@@ -703,13 +733,18 @@ class EngineCore:
             return None
 
         future = Future[Any]()
+        self._lifecycle_transition = future
 
         def pause_complete(f: Future):
             try:
                 f.result()
-                future.set_result(model_executor.suspend(level))
+                result = model_executor.suspend(level)
             except Exception as e:
+                self._lifecycle_transition = None
                 future.set_exception(e)
+            else:
+                self._lifecycle_transition = None
+                future.set_result(result)
 
         logger.info("Waiting for in-flight requests to complete before suspending...")
         pause_future.add_done_callback(pause_complete)
@@ -717,12 +752,25 @@ class EngineCore:
 
     def resume(self, tags: list[str] | None = None) -> None:
         """Start pipelined restoration, then admit requests waiting on layers."""
+        self._require_no_lifecycle_transition("resume")
+        current_platform.validate_resume_tags(self.vllm_config, tags)
         self.model_executor.resume(tags)
         self.resume_scheduler()
 
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
+        transition = getattr(self, "_lifecycle_transition", None)
+        if transition is not None and not transition.done():
+            return False
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
+
+    def _require_no_lifecycle_transition(self, operation: str) -> None:
+        transition = getattr(self, "_lifecycle_transition", None)
+        if transition is not None and not transition.done():
+            raise RuntimeError(
+                f"Cannot {operation} while a sleep or suspend transition is still "
+                "in progress"
+            )
 
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
@@ -1052,8 +1100,17 @@ class EngineCoreProc(EngineCore):
         return init_message.addresses
 
     @staticmethod
-    def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
+    def run_engine_core(
+        *args,
+        dp_rank: int = 0,
+        local_dp_rank: int = 0,
+        expected_parent_pid: int | None = None,
+        **kwargs,
+    ):
         """Launch EngineCore busy loop in background process."""
+
+        if expected_parent_pid is not None:
+            arm_parent_death_signal(expected_parent_pid, process_name="EngineCore")
 
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
@@ -1272,8 +1329,9 @@ class EngineCoreProc(EngineCore):
                 return
             output = UtilityOutput(call_id)
             # Lazily look-up utility method so that failure will be handled/returned.
-            get_result = lambda: (method := getattr(self, method_name)) and method(
-                *self._convert_msgspec_args(method, args)
+            get_result = lambda: (
+                (method := getattr(self, method_name))
+                and method(*self._convert_msgspec_args(method, args))
             )
             enqueue_output = lambda out: self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=out))
@@ -1538,6 +1596,7 @@ class EngineCoreProc(EngineCore):
         - ``keep``: Set PAUSED_ALL; return a Future that completes when the
           output queue is empty.
         """
+        self._require_no_lifecycle_transition("pause_scheduler")
         if mode not in ("keep", "abort", "wait"):
             raise ValueError(f"Invalid pause mode: {mode}")
 

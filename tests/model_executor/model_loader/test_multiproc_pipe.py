@@ -16,11 +16,45 @@ from vllm.model_executor.model_loader.base_loader import (
 )
 
 
+class _AuxImplementation:
+    shared_persistent = torch.full((1,), 6.0)
+    shared_scratch = torch.full((1,), 7.0)
+
+    def __init__(self) -> None:
+        self.derived_weight = torch.full((1,), 3.0)
+        self.nested_weights = {"scale": torch.full((1,), 4.0)}
+
+    def get_multiproc_pipe_persistent_tensors(self):
+        return (type(self).shared_persistent,)
+
+
+class _LayerWithExternalPersistentTensor(nn.Linear):
+    external_persistent = torch.full((1,), 8.0)
+    external_scratch = torch.full((1,), 9.0)
+
+    def get_multiproc_pipe_persistent_tensors(self):
+        return (type(self).external_persistent,)
+
+
+class _ExternalPersistentComponent:
+    persistent_index = torch.full((1,), 10.0)
+    scratch_workspace = torch.full((1,), 11.0)
+
+    def get_multiproc_pipe_persistent_tensors(self):
+        return (type(self).persistent_index,)
+
+
 class _LayeredModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.public_weight = nn.Parameter(torch.zeros(1))
-        self.layers = nn.ModuleList([nn.Linear(1, 1), nn.Linear(1, 1)])
+        self.public_auxiliary = torch.full((1,), 2.0)
+        self.layers = nn.ModuleList(
+            [_LayerWithExternalPersistentTensor(1, 1), nn.Linear(1, 1)]
+        )
+        self.layers[0].impl = _AuxImplementation()
+        self.layers[1].private_auxiliary = torch.full((1,), 5.0)
+        self.layers[1].custom_op = _ExternalPersistentComponent()
         self.register_buffer("public_buffer", torch.ones(1))
 
 
@@ -35,13 +69,37 @@ def test_locate_splited_weights_builds_postprocessed_layer_address_map() -> None
     public_addresses = {
         model.public_weight.data_ptr(),
         model.public_buffer.data_ptr(),
+        model.public_auxiliary.data_ptr(),
     }
     assert public_addresses <= set(layer_to_addr["pub"])
     assert {parameter.data_ptr() for parameter in model.layers[0].parameters()} <= set(
         layer_to_addr["layers.0"]
     )
+    assert model.layers[0].impl.derived_weight.data_ptr() in layer_to_addr["layers.0"]
+    assert (
+        model.layers[0].impl.nested_weights["scale"].data_ptr()
+        in layer_to_addr["layers.0"]
+    )
+    assert _AuxImplementation.shared_persistent.data_ptr() in layer_to_addr["layers.0"]
+    assert _AuxImplementation.shared_scratch.data_ptr() not in addr_to_layer
+    assert (
+        _LayerWithExternalPersistentTensor.external_persistent.data_ptr()
+        in layer_to_addr["layers.0"]
+    )
+    assert (
+        _LayerWithExternalPersistentTensor.external_scratch.data_ptr()
+        not in addr_to_layer
+    )
     assert {parameter.data_ptr() for parameter in model.layers[1].parameters()} <= set(
         layer_to_addr["layers.1"]
+    )
+    assert model.layers[1].private_auxiliary.data_ptr() in layer_to_addr["layers.1"]
+    assert (
+        _ExternalPersistentComponent.persistent_index.data_ptr()
+        in layer_to_addr["layers.1"]
+    )
+    assert (
+        _ExternalPersistentComponent.scratch_workspace.data_ptr() not in addr_to_layer
     )
     assert set(addr_to_layer) == {
         address for addresses in layer_to_addr.values() for address in addresses

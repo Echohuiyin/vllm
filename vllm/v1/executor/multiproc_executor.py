@@ -59,9 +59,15 @@ from vllm.utils.system_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerWrapperBase
+from vllm.v1.worker.worker_base import (
+    WorkerFatalError,
+    WorkerRetryableError,
+    WorkerWrapperBase,
+)
 
 logger = init_logger(__name__)
+
+_FAIL_STOP_RPC_METHODS = frozenset({"sleep", "wake_up", "suspend", "resume"})
 
 
 class FutureWrapper(Future):
@@ -104,10 +110,10 @@ class MultiprocExecutor(Executor):
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
-        self.is_failed = False
-        self.failure_callback: FailureCallback | None = None
+        self._init_failure_state()
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
+
         assert self.world_size == tp_size * pp_size * pcp_size, (
             f"world_size ({self.world_size}) must be equal to the "
             f"tensor_parallel_size ({tp_size}) x pipeline"
@@ -254,6 +260,12 @@ class MultiprocExecutor(Executor):
 
         self.output_rank = self._get_output_rank()
 
+    def _init_failure_state(self) -> None:
+        """Initialize state shared by upstream and platform executor setup."""
+        self.is_failed = False
+        self.failure_callback: FailureCallback | None = None
+        self._failure_lock = threading.Lock()
+
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
         assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
@@ -287,16 +299,11 @@ class MultiprocExecutor(Executor):
             if not _self or getattr(_self, "shutting_down", False):
                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
-            _self.is_failed = True
             proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
             logger.error(
                 "Worker proc %s died unexpectedly, shutting down executor.", proc_name
             )
-            _self.shutdown()
-            callback = _self.failure_callback
-            if callback is not None:
-                _self.failure_callback = None
-                callback()
+            _self._handle_worker_failure()
 
         if not inline:
             Thread(
@@ -307,10 +314,29 @@ class MultiprocExecutor(Executor):
         monitor_workers()
 
     def register_failure_callback(self, callback: FailureCallback):
-        if self.is_failed:
+        with self._failure_lock:
+            notify_now = self.is_failed
+            if not notify_now:
+                self.failure_callback = callback
+        if notify_now:
             callback()
-        else:
-            self.failure_callback = callback
+
+    def _handle_worker_failure(self) -> None:
+        """Fail the executor and notify EngineCore exactly once."""
+        with self._failure_lock:
+            if self.is_failed:
+                return
+            self.is_failed = True
+            callback = self.failure_callback
+            self.failure_callback = None
+        try:
+            self.shutdown()
+        finally:
+            # EngineCore must be notified even if queue/process cleanup itself
+            # reports an error; otherwise a fatal split lifecycle state could
+            # leave the scheduler process alive and accepting utility calls.
+            if callback is not None:
+                callback()
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
@@ -379,7 +405,24 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        additional_config = self.vllm_config.additional_config
+        fail_stop_rpc = (
+            isinstance(method, str)
+            and method in _FAIL_STOP_RPC_METHODS
+            and isinstance(additional_config, dict)
+            and additional_config.get("multiproc_pipe") is True
+        )
+        try:
+            enqueue_timeout = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            self.rpc_broadcast_mq.enqueue(
+                (send_method, args, kwargs, output_rank), timeout=enqueue_timeout
+            )
+        except BaseException:
+            if fail_stop_rpc:
+                self._handle_worker_failure()
+            raise
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -387,6 +430,7 @@ class MultiprocExecutor(Executor):
 
         def get_response():
             responses = []
+            failures = []
             for mq in response_mqs:
                 dequeue_timeout = (
                     None if deadline is None else (deadline - time.monotonic())
@@ -394,13 +438,32 @@ class MultiprocExecutor(Executor):
                 try:
                     status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
+                    if fail_stop_rpc:
+                        self._handle_worker_failure()
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
-                    )
+                    if not fail_stop_rpc:
+                        raise RuntimeError(
+                            f"Worker failed with error '{result}', please check the"
+                            " stack trace above for the root cause"
+                        )
+                    failures.append((status, result))
+                    continue
                 responses.append(result)
+            if failures:
+                all_retryable = len(failures) == len(response_mqs) and all(
+                    status == WorkerProc.ResponseStatus.RETRYABLE_FAILURE
+                    for status, _ in failures
+                )
+                error_type = WorkerRetryableError if all_retryable else RuntimeError
+                if not all_retryable:
+                    # A lifecycle RPC may already have succeeded on another
+                    # rank, so any mixed or non-retryable result is fail-stop.
+                    self._handle_worker_failure()
+                raise error_type(
+                    f"Worker failed with error '{failures[0][1]}', please check the"
+                    " stack trace above for the root cause"
+                )
             return responses[0] if output_rank is not None else responses
 
         if non_block:
@@ -411,9 +474,19 @@ class MultiprocExecutor(Executor):
         # First drain any pending futures in the queue.
         while self.futures_queue:
             future, get_fut_response = self.futures_queue.pop()
-            future.wait_for_response(get_fut_response)
+            try:
+                future.wait_for_response(get_fut_response)
+            except BaseException as error:
+                if fail_stop_rpc and not isinstance(error, WorkerRetryableError):
+                    self._handle_worker_failure()
+                raise
 
-        return aggregate(get_response())
+        try:
+            return aggregate(get_response())
+        except BaseException as error:
+            if fail_stop_rpc and not isinstance(error, WorkerRetryableError):
+                self._handle_worker_failure()
+            raise
 
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):
@@ -908,6 +981,7 @@ class WorkerProc:
     class ResponseStatus(Enum):
         SUCCESS = auto()
         FAILURE = auto()
+        RETRYABLE_FAILURE = auto()
 
     def enqueue_output(self, output: Any):
         """Prepares output from the worker and enqueues it to the
@@ -917,7 +991,9 @@ class WorkerProc:
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
 
-        if isinstance(output, Exception):
+        if isinstance(output, WorkerRetryableError):
+            result = (WorkerProc.ResponseStatus.RETRYABLE_FAILURE, str(output))
+        elif isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
@@ -954,6 +1030,14 @@ class WorkerProc:
                     func = partial(cloudpickle.loads(method), self.worker)
 
                 output = func(*args, **kwargs)
+            except WorkerFatalError as e:
+                logger.critical("WorkerProc hit a fatal worker error: %s", e)
+                if output_rank is None or self.rank == output_rank:
+                    # SystemExit is intentionally not an Exception, so wrap it
+                    # for the existing failure-response protocol before the
+                    # worker exits and its monitor tears down peer ranks.
+                    self.enqueue_output(RuntimeError(str(e)))
+                raise
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
